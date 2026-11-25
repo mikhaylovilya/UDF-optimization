@@ -110,33 +110,52 @@ AS
 -- СПИСОК РАБОТ
 begin
 insert into @result
-SELECT
-  Works.Id_Work,
-  Works.CREATE_Date,
-  Works.MaterialNumber,
-  Works.IS_Complit,
-  Works.FIO,
-  convert(varchar(10), works.CREATE_Date, 104 ) as D_DATE,
-  dbo.F_WORKITEMS_COUNT_BY_ID_WORK(works.Id_Work,0) as WorkItemsNotComplit,
-  dbo.F_WORKITEMS_COUNT_BY_ID_WORK(works.Id_Work,1) as WorkItemsComplit,
-  dbo.F_EMPLOYEE_FULLNAME(Works.Id_Employee) as EmployeeFullName,
-  Works.StatusId,
-  WorkStatus.StatusName,
+SELECT TOP (3000)
+  w.Id_Work,
+  w.CREATE_Date,
+  w.MaterialNumber,
+  w.IS_Complit,
+  w.FIO,
+  convert(varchar(10), w.CREATE_Date, 104) as D_DATE,
+  ISNULL(agg.WorkItemsNotComplit, 0) as WorkItemsNotComplit,
+  ISNULL(agg.WorkItemsComplit, 0) as WorkItemsComplit,
+  CASE
+      WHEN e.Id_Employee IS NULL THEN ''
+      ELSE RTRIM(REPLACE(
+        e.Surname + ' ' +
+        UPPER(SUBSTRING(e.Name, 1, 1)) + '. ' +
+        UPPER(SUBSTRING(e.Patronymic, 1, 1)) + '.',
+        '. .', ''))
+  END as FULL_NAME,
+  w.StatusId,
+  ws.StatusName,
   case
-      when (Works.Print_Date is not null) or
-      (Works.SendToClientDate is not null) or
-      (works.SendToDoctorDate is not null) or
-      (Works.SendToOrgDate is not null) or
-      (Works.SendToFax is not null)
+      when (w.Print_Date is not null) or
+      (w.SendToClientDate is not null) or
+      (w.SendToDoctorDate is not null) or
+      (w.SendToOrgDate is not null) or
+      (w.SendToFax is not null)
       then 1
       else 0
-  end as Is_Print  
+  end as Is_Print
 FROM
- Works
- left outer join WorkStatus on (Works.StatusId = WorkStatus.StatusID)
+  Works as w
+  left outer join WorkStatus as ws on (w.StatusId = ws.StatusID)
+  left outer join Employee as e on (e.Id_Employee = w.Id_Employee)
+  left outer join (
+    select
+      wi.Id_Work,
+      SUM(case when wi.Is_Complit = 0 then 1 else 0 end) as WorkItemsNotComplit,
+      SUM(case when wi.Is_Complit = 1 then 1 else 0 end) as WorkItemsComplit
+    from WorkItem as wi
+    inner join Analiz as a
+      on (a.ID_ANALIZ = wi.ID_ANALIZ)
+     and ISNULL(a.IS_GROUP, 0) = 0
+    group by wi.Id_Work
+  ) as agg on (agg.Id_Work = w.Id_Work)
 where
- WORKS.IS_DEL <> 1
- order by id_work desc -- works.MaterialNumber desc
+  w.Is_Del = 0
+order by w.Id_Work desc -- works.MaterialNumber desc
 return
 end
 
@@ -404,6 +423,24 @@ CREATE NONCLUSTERED INDEX [XIF3Works] ON [dbo].[Works]
 (
 	[Id_Employee_Del] ASC
 )WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
+GO
+/****** Object:  Index [IX_Works_IsDel_IdWork]    Script Date: 28.04.2024 19:21:25 ******/
+CREATE NONCLUSTERED INDEX [IX_Works_IsDel_IdWork] ON [dbo].[Works]
+(
+	[Is_Del] ASC,
+	[Id_Work] DESC
+)
+INCLUDE ([CREATE_Date], [MaterialNumber], [IS_Complit], [FIO], [StatusId], [Id_Employee], [Print_Date], [SendToClientDate], [SendToDoctorDate], [SendToOrgDate], [SendToFax])
+WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
+GO
+/****** Object:  Index [IX_WorkItem_IdWork_IsComplit]    Script Date: 28.04.2024 19:21:25 ******/
+CREATE NONCLUSTERED INDEX [IX_WorkItem_IdWork_IsComplit] ON [dbo].[WorkItem]
+(
+	[Id_Work] ASC,
+	[Is_Complit] ASC
+)
+INCLUDE ([ID_ANALIZ])
+WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
 GO
 ALTER TABLE [dbo].[Employee] ADD  DEFAULT (suser_sname()) FOR [Login_Name]
 GO
