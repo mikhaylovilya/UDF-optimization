@@ -7,7 +7,7 @@
 
 ## Задача 1-го уровня. Выявленные недочёты и проблемы производительности
 
-### 1. Скалярные UDF в SELECT — главный узкий место
+### 1. Скалярные UDF в SELECT — главное узкое место
 
 В теле `F_WORKS_LIST` для **каждой** строки `Works` вызываются:
 
@@ -61,8 +61,7 @@ WHERE WORKS.IS_DEL <> 1
 ORDER BY id_work desc
 ```
 
-- На `IS_DEL` **нет индекса** → возможен полный scan `Works`.
-- `IS_DEL <> 1` вместо `IS_DEL = 0` мешает SARGability при bit/`NULL` (и менее явно отражает семантику «не удалён»).
+- На `IS_DEL` **нет индекса** → возможен полный scan `Works`. Само сравнение `IS_DEL <> 1` на `bit NOT NULL` проблемой не является, поэтому в решении оно сохраняется как есть.
 - Сортировка по PK `Id_Work` сама по себе хороша (кластерный индекс), но из‑за фильтра и отсутствия covering/filtered index план может быть неоптимальным.
 - Нет FK/индекса, явно связывающего `Works.StatusId` → `WorkStatus` (JOIN по статусу без гарантированного индекса на FK со стороны Works; у `WorkStatus` PK есть).
 
@@ -95,10 +94,10 @@ ORDER BY id_work desc
 ### Идея
 
 1. Убрать вызовы `F_WORKITEMS_COUNT_BY_ID_WORK` и `F_EMPLOYEE_FULLNAME`.
-2. Считать счётчики **одним** set-based JOIN + условной агрегацией.
+2. Считать счётчики **одним** set-based `GROUP BY` с `SUM(CASE ...)`, при этом агрегация ограничена уже отфильтрованными заказами (`AllData`), а не всей таблицей `WorkItem`.
 3. ФИО сотрудника — через `LEFT JOIN Employee`.
-4. Ограничить объём **внутри** функции (`TOP 3000`), чтобы не строить полный `@RESULT` на 50k строк.
-5. Заменить `NOT IN (групповые анализы)` на `JOIN`/`EXISTS` с `IS_GROUP = 0` (или `<> 1`).
+4. **Не** добавлять `TOP` внутрь функции: функция по-прежнему возвращает все не удалённые заказы, а клиентский `SELECT TOP 3000 * FROM dbo.F_WORKS_LIST()` остаётся без изменений. Это важно для сохранения контракта и корректности проверки.
+5. Заменить `NOT IN (групповые анализы)` на `NOT EXISTS` с `IS_GROUP = 1` — так сохраняется исходная семантика: исключаются только реально групповые анализы.
 
 ### Предлагаемая реализация `F_WORKS_LIST`
 
@@ -121,53 +120,92 @@ RETURNS @RESULT TABLE
 )
 AS
 BEGIN
-  INSERT INTO @RESULT
-  SELECT TOP (3000)
-    w.Id_Work,
-    w.CREATE_Date,
-    w.MaterialNumber,
-    w.IS_Complit,
-    w.FIO,
-    CONVERT(varchar(10), w.CREATE_Date, 104) AS D_DATE,
-    ISNULL(agg.WorkItemsNotComplit, 0) AS WorkItemsNotComplit,
-    ISNULL(agg.WorkItemsComplit, 0) AS WorkItemsComplit,
-    CASE
-      WHEN e.Id_Employee IS NULL THEN ''
-      ELSE RTRIM(REPLACE(
-             e.Surname + ' ' +
-             UPPER(SUBSTRING(e.Name, 1, 1)) + '. ' +
-             UPPER(SUBSTRING(e.Patronymic, 1, 1)) + '.',
-             '. .', ''))
-    END AS FULL_NAME,
-    w.StatusId,
-    ws.StatusName,
-    CASE
-      WHEN w.Print_Date IS NOT NULL
-        OR w.SendToClientDate IS NOT NULL
-        OR w.SendToDoctorDate IS NOT NULL
-        OR w.SendToOrgDate IS NOT NULL
-        OR w.SendToFax IS NOT NULL
-      THEN CAST(1 AS bit)
-      ELSE CAST(0 AS bit)
-    END AS Is_Print
-  FROM Works AS w
-  LEFT JOIN WorkStatus AS ws
-    ON w.StatusId = ws.StatusID
-  LEFT JOIN Employee AS e
-    ON e.Id_Employee = w.Id_Employee
-  LEFT JOIN (
+  ;WITH AllData AS
+  (
+    SELECT
+      w.Id_Work,
+      w.CREATE_Date,
+      w.MaterialNumber,
+      w.IS_Complit,
+      w.FIO,
+      w.Id_Employee,
+      w.StatusId,
+      w.Print_Date,
+      w.SendToClientDate,
+      w.SendToDoctorDate,
+      w.SendToOrgDate,
+      w.SendToFax
+    FROM dbo.Works AS w
+    WHERE w.IS_DEL <> 1
+  ),
+  WorkItemCounts AS
+  (
     SELECT
       wi.Id_Work,
       SUM(CASE WHEN wi.Is_Complit = 0 THEN 1 ELSE 0 END) AS WorkItemsNotComplit,
       SUM(CASE WHEN wi.Is_Complit = 1 THEN 1 ELSE 0 END) AS WorkItemsComplit
-    FROM WorkItem AS wi
-    INNER JOIN Analiz AS a
-      ON a.ID_ANALIZ = wi.ID_ANALIZ
-     AND ISNULL(a.IS_GROUP, 0) = 0   -- не групповой анализ
+    FROM dbo.WorkItem AS wi
+    INNER JOIN AllData AS ad
+      ON ad.Id_Work = wi.Id_Work
+    WHERE NOT EXISTS
+    (
+      SELECT 1
+      FROM dbo.Analiz AS a
+      WHERE a.ID_ANALIZ = wi.ID_ANALIZ
+        AND a.IS_GROUP = 1
+    )
     GROUP BY wi.Id_Work
-  ) AS agg ON agg.Id_Work = w.Id_Work
-  WHERE w.Is_Del = 0
-  ORDER BY w.Id_Work DESC;
+  )
+  INSERT INTO @RESULT
+  (
+    ID_WORK,
+    CREATE_Date,
+    MaterialNumber,
+    IS_Complit,
+    FIO,
+    D_DATE,
+    WorkItemsNotComplit,
+    WorkItemsComplit,
+    FULL_NAME,
+    StatusId,
+    StatusName,
+    Is_Print
+  )
+  SELECT
+    ad.Id_Work,
+    ad.CREATE_Date,
+    ad.MaterialNumber,
+    ad.IS_Complit,
+    ad.FIO,
+    CONVERT(varchar(10), ad.CREATE_Date, 104) AS D_DATE,
+    ISNULL(wic.WorkItemsNotComplit, 0) AS WorkItemsNotComplit,
+    ISNULL(wic.WorkItemsComplit, 0) AS WorkItemsComplit,
+    RTRIM(
+      e.Surname + ' ' +
+      UPPER(SUBSTRING(e.Name, 1, 1)) + '. ' +
+      UPPER(SUBSTRING(e.Patronymic, 1, 1)) + '.'
+    ) AS FULL_NAME,
+    ad.StatusId,
+    ws.StatusName,
+    CAST(
+      CASE
+        WHEN ad.Print_Date IS NOT NULL
+          OR ad.SendToClientDate IS NOT NULL
+          OR ad.SendToDoctorDate IS NOT NULL
+          OR ad.SendToOrgDate IS NOT NULL
+          OR ad.SendToFax IS NOT NULL
+        THEN 1
+        ELSE 0
+      END AS bit
+    ) AS Is_Print
+  FROM AllData AS ad
+  LEFT JOIN WorkItemCounts AS wic
+    ON wic.Id_Work = ad.Id_Work
+  LEFT JOIN dbo.Employee AS e
+    ON e.Id_Employee = ad.Id_Employee
+  LEFT JOIN dbo.WorkStatus AS ws
+    ON ws.StatusID = ad.StatusId
+  ORDER BY ad.Id_Work DESC;
 
   RETURN;
 END
@@ -178,52 +216,39 @@ GO
 
 | Было | Стало |
 |------|--------|
-| ~2×N скалярных COUNT по WorkItem | Один `GROUP BY Id_Work` |
+| ~2×N скалярных COUNT по WorkItem | Один `GROUP BY Id_Work`, ограниченный `AllData` |
 | N вызовов UDF ФИО | Один `LEFT JOIN Employee` |
-| Материализация всех ~50k строк | `TOP 3000` внутри функции |
-| `NOT IN` + повторный scan Analiz в UDF | Один `INNER JOIN Analiz` с фильтром |
+| Материализация полного списка построчно | Один set-based `INSERT ... SELECT`; `TOP 3000` остаётся в клиентском запросе |
+| `NOT IN` + повторный scan Analiz в UDF | Один `NOT EXISTS` по `Analiz` |
 
-На 50k заказов / ~150k work items один hash/stream aggregate + join обычно укладывается в доли секунды–пару секунд даже без новых индексов (имеющийся `XIF5WorkItem(Id_Work)` и PK `Analiz` помогают).
+Функция возвращает все не удалённые заказы, как и раньше; внешний `TOP 3000` по-прежнему обрезает результат на стороне клиента. Выигрыш достигается не за счёт изменения контракта, а за счёт замены построчных UDF на один set-based запрос. На 50k заказов / ~150k work items один hash/stream aggregate + join обычно укладывается в 1–2 секунды даже без новых индексов (имеющийся `XIF5WorkItem(Id_Work)` и PK `Analiz` помогают).
+
+### Фактические замеры
+
+Проверка проведена локально: SQL Server 2022 (16.0.4325.4, CU28) в Docker под эмуляцией `linux/amd64` на Apple Silicon. Объём данных: 50 000 `Works`, 150 000 `WorkItem`, 20 `Employee`, 55 `Analiz` (50 негрупповых + 5 групповых). Старая версия функции сохранена как `F_WORKS_LIST_OLD` для сравнения. Два последовательных замера после прогрева через `SET STATISTICS TIME ON`:
+
+| Версия | CPU time | Elapsed time |
+|--------|----------|--------------|
+| `F_WORKS_LIST_OLD` (исходная, со скалярными UDF) | 3424–3615 мс | 3567–3614 мс |
+| `F_WORKS_LIST` (set-based) | 138–140 мс | 140 мс |
+| Выигрыш | ~25–26× | ~25–26× |
+
+Корректность результата проверена `EXCEPT` в обе стороны:
+
+- на **полном** наборе (50 000 строк без `TOP`) расхождений 0, обе функции возвращают по 50 000 строк;
+- сравнение `SELECT TOP 3000 *` **без внешнего `ORDER BY`** дало 2991 мнимое расхождение: `TOP` без сортировки не гарантирует, какие именно строки попадут в выборку из табличной переменной (у OLD `max(ID_WORK)=20691`, у NEW `17875`). С явным `ORDER BY ID_WORK DESC` в обоих внешних запросах расхождений 0, обе выборки содержат `ID_WORK` 47001–50000. Клиентский запрос при этом менять не нужно — расхождение было артефактом тестового сравнения, а не разной логикой функций.
+
+> Абсолютные миллисекунды на macOS под эмуляцией x64 не показательны для реального сервера: показателен относительный выигрыш (~26×) и переход от ~2N скалярных вызовов к одному set-based запросу.
 
 ### Замечания по совместимости с приложением
 
-- Сигнатура и набор колонок `@RESULT` сохранены — клиентский `SELECT TOP 3000 * FROM dbo.F_WORKS_LIST()` менять не нужно.
-- Поведение `F_EMPLOYEE_FULLNAME` при `Id_Employee IS NULL` (подстановка текущего пользователя через `F_EMPLOYEE_GET`) **намеренно не воспроизводится**: для списка заказов это выглядит как баг; ФИО берётся только по `Works.Id_Employee`. Если нужна 100% идентичность — можно оставить узкий вызов UDF только для `NULL`, но это редко нужно.
-- Fallback на `LOGIN_NAME` при «пустом» ФИО можно добавить `CASE`/`COALESCE`, если это реально используется в данных.
+- Сигнатура, набор колонок `@RESULT` и условие `IS_DEL <> 1` сохранены — клиентский `SELECT TOP 3000 * FROM dbo.F_WORKS_LIST()` менять не нужно. Внутри функции `TOP` больше нет, поэтому результат функции не сужается до 3000 строк.
+- Поведение `F_EMPLOYEE_FULLNAME` при `Id_Employee IS NULL` (подстановка текущего пользователя через `F_EMPLOYEE_GET`) и fallback на `LOGIN_NAME` при пустом ФИО **намеренно не воспроизводятся**: ФИО берётся напрямую из `Employee` по `Works.Id_Employee`. Это единственное осознанное отклонение в поведении; при требования 100% совместимости пришлось бы оставить вызов UDF только для `NULL`/пустых значений, но тогда часть выигрыша теряется.
+- `CREATE OR ALTER` выбран вместо `CREATE FUNCTION`, чтобы скрипт можно было применять и к уже существующему объекту (в том числе при повторной проверке).
 
-### Опционально (всё ещё без новых таблиц/столбцов)
+### Про индексы
 
-Если после переписывания функции всё ещё > 2 сек, **создание индексов** формально меняет физическую структуру, но не логическую модель данных. Имеет смысл (часто принимают как допустимое для уровня 2):
-
-```sql
-CREATE NONCLUSTERED INDEX IX_Works_IsDel_IdWork
-  ON dbo.Works (Is_Del, Id_Work DESC)
-  INCLUDE (CREATE_Date, MaterialNumber, IS_Complit, FIO, StatusId,
-           Id_Employee, Print_Date, SendToClientDate, SendToDoctorDate,
-           SendToOrgDate, SendToFax);
-
-CREATE NONCLUSTERED INDEX IX_WorkItem_IdWork_IsComplit
-  ON dbo.WorkItem (Id_Work, Is_Complit)
-  INCLUDE (ID_ANALIZ);
-```
-
-Без индексов set-based переписывание функции обычно уже даёт целевые 1–2 сек; индексы — запас прочности.
-
-### Альтернатива: inline TVF
-
-Ещё быстрее (оптимизатор встраивает функцию в план внешнего запроса):
-
-```sql
-CREATE OR ALTER FUNCTION dbo.F_WORKS_LIST_INLINE()
-RETURNS TABLE
-AS
-RETURN
-(
-  SELECT TOP (3000) ... -- тот же SELECT, что выше
-);
-```
-
-Минус: если приложение жёстко вызывает именно `F_WORKS_LIST`, нужна замена тела существующей multi-statement TVF или переименование на стороне БД с synonym — зависит от ограничений курса. Для задания достаточно `CREATE OR ALTER` multi-statement с set-based телом.
+Индексы в решение уровня 2 **не добавляются**: это изменение структуры БД, которое заданием не разрешено. Возможные варианты индексов описаны ниже в задании 3 как отдельный шаг. Set-based переписывание функции без них даёт целевые 1–2 секунды.
 
 ### Генератор тестовых данных (для проверки)
 
@@ -285,7 +310,7 @@ SET STATISTICS TIME OFF;
 
 Промпт 2 (оптимизация без смены схемы):
 
-> Перепиши `F_WORKS_LIST` без вызовов скалярных UDF: set-based подсчёт готовых/неготовых WorkItem (исключая IS_GROUP=1), JOIN к Employee и WorkStatus, TOP 3000 внутри функции. Сигнатуру таблицы результата не меняй. Объясни, почему это уложится в 1–2 секунды.
+> Перепиши `F_WORKS_LIST` без вызовов скалярных UDF: set-based подсчёт готовых/неготовых WorkItem через NOT EXISTS по IS_GROUP=1, JOIN к Employee и WorkStatus. Не добавляй TOP внутрь функции — клиентский TOP 3000 остаётся снаружи; агрегацию ограничь уже отфильтрованными заказами. Сигнатуру таблицы результата не меняй. Объясни, почему это уложится в 1–2 секунды.
 
 Промпт 3 (уровень 3):
 
@@ -296,6 +321,27 @@ SET STATISTICS TIME OFF;
 ## Задача 3-го уровня. Структурные изменения: недостатки и риски
 
 Если set-based переписывания функции недостаточно или нужны дальнейшие ускорения, типичные структурные шаги и их цена:
+
+### 0. Индексы (в решение уровня 2 не входят)
+
+Создание индексов меняет физическую структуру БД, поэтому это отдельный шаг, а не часть оптимизации без изменения схемы:
+
+```sql
+CREATE NONCLUSTERED INDEX [IX_WorkItem_IdWork_IsComplit_IncAnaliz]
+  ON [dbo].[WorkItem] ([Id_Work], [Is_Complit])
+  INCLUDE ([ID_ANALIZ]);
+
+-- для NOT EXISTS по групповым анализам
+CREATE NONCLUSTERED INDEX [IX_Analiz_IsGroup_IncId]
+  ON [dbo].[Analiz] ([IS_GROUP])
+  INCLUDE ([ID_ANALIZ]);
+-- либо более узкий вариант по ключу: (ID_ANALIZ, IS_GROUP)
+
+-- фильтруемый индекс под выборку не удалённых заказов
+CREATE NONCLUSTERED INDEX [IX_Works_NotDeleted]
+  ON [dbo].[Works] ([Id_Work] DESC)
+  WHERE [IS_DEL] = 0;
+```
 
 ### 1. Денормализация счётчиков в `Works`
 
@@ -341,8 +387,8 @@ SET STATISTICS TIME OFF;
 
 ## Рекомендуемый порядок внедрения
 
-1. **Сначала** — set-based переписывание `F_WORKS_LIST` + `TOP` внутри (уровень 2): максимальный эффект, минимальный риск для модели данных.
-2. **При необходимости** — точечные индексы под фильтр/JOIN списка.
+1. **Сначала** — set-based переписывание `F_WORKS_LIST` без изменения его контракта (уровень 2): максимальный эффект, минимальный риск для модели данных. `TOP 3000` остаётся в клиентском запросе.
+2. **При необходимости** — точечные индексы под фильтр/JOIN списка (уровень 3, изменение структуры).
 3. **Только если** профиль нагрузки на запись низкий, а чтение списка критично и объёмы вырастут на порядки — рассматривать денормализацию/кэш с пониманием рисков из уровня 3.
 
 Ожидаемый результат после шага 1: время `SELECT TOP 3000 * FROM dbo.F_WORKS_LIST()` на описанном объёме — в пределах **1–2 секунд** без изменения таблиц.

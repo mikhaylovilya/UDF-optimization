@@ -89,7 +89,7 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
-CREATE FUNCTION [dbo].[F_WORKS_LIST] (
+CREATE OR ALTER FUNCTION [dbo].[F_WORKS_LIST] (
 )
 RETURNS @RESULT TABLE
 (
@@ -109,54 +109,93 @@ Is_Print bit
 AS
 -- СПИСОК РАБОТ
 begin
-insert into @result
-SELECT TOP (3000)
-  w.Id_Work,
-  w.CREATE_Date,
-  w.MaterialNumber,
-  w.IS_Complit,
-  w.FIO,
-  convert(varchar(10), w.CREATE_Date, 104) as D_DATE,
-  ISNULL(agg.WorkItemsNotComplit, 0) as WorkItemsNotComplit,
-  ISNULL(agg.WorkItemsComplit, 0) as WorkItemsComplit,
-  CASE
-      WHEN e.Id_Employee IS NULL THEN ''
-      ELSE RTRIM(REPLACE(
-        e.Surname + ' ' +
-        UPPER(SUBSTRING(e.Name, 1, 1)) + '. ' +
-        UPPER(SUBSTRING(e.Patronymic, 1, 1)) + '.',
-        '. .', ''))
-  END as FULL_NAME,
-  w.StatusId,
-  ws.StatusName,
-  case
-      when (w.Print_Date is not null) or
-      (w.SendToClientDate is not null) or
-      (w.SendToDoctorDate is not null) or
-      (w.SendToOrgDate is not null) or
-      (w.SendToFax is not null)
-      then 1
-      else 0
-  end as Is_Print
-FROM
-  Works as w
-  left outer join WorkStatus as ws on (w.StatusId = ws.StatusID)
-  left outer join Employee as e on (e.Id_Employee = w.Id_Employee)
-  left outer join (
-    select
+  ;WITH AllData AS
+  (
+    SELECT
+      w.Id_Work,
+      w.CREATE_Date,
+      w.MaterialNumber,
+      w.IS_Complit,
+      w.FIO,
+      w.Id_Employee,
+      w.StatusId,
+      w.Print_Date,
+      w.SendToClientDate,
+      w.SendToDoctorDate,
+      w.SendToOrgDate,
+      w.SendToFax
+    FROM dbo.Works as w
+    WHERE w.IS_DEL <> 1
+  ),
+  WorkItemCounts AS
+  (
+    SELECT
       wi.Id_Work,
       SUM(case when wi.Is_Complit = 0 then 1 else 0 end) as WorkItemsNotComplit,
       SUM(case when wi.Is_Complit = 1 then 1 else 0 end) as WorkItemsComplit
-    from WorkItem as wi
-    inner join Analiz as a
-      on (a.ID_ANALIZ = wi.ID_ANALIZ)
-     and ISNULL(a.IS_GROUP, 0) = 0
-    group by wi.Id_Work
-  ) as agg on (agg.Id_Work = w.Id_Work)
-where
-  w.Is_Del = 0
-order by w.Id_Work desc -- works.MaterialNumber desc
-return
+    FROM dbo.WorkItem as wi
+    INNER JOIN AllData as ad
+      on ad.Id_Work = wi.Id_Work
+    WHERE NOT EXISTS
+    (
+      SELECT 1
+      FROM dbo.Analiz as a
+      WHERE a.ID_ANALIZ = wi.ID_ANALIZ
+        and a.IS_GROUP = 1
+    )
+    GROUP BY wi.Id_Work
+  )
+  insert into @result
+  (
+    ID_WORK,
+    CREATE_Date,
+    MaterialNumber,
+    IS_Complit,
+    FIO,
+    D_DATE,
+    WorkItemsNotComplit,
+    WorkItemsComplit,
+    FULL_NAME,
+    StatusId,
+    StatusName,
+    Is_Print
+  )
+  SELECT
+    ad.Id_Work,
+    ad.CREATE_Date,
+    ad.MaterialNumber,
+    ad.IS_Complit,
+    ad.FIO,
+    convert(varchar(10), ad.CREATE_Date, 104) as D_DATE,
+    ISNULL(wic.WorkItemsNotComplit, 0) as WorkItemsNotComplit,
+    ISNULL(wic.WorkItemsComplit, 0) as WorkItemsComplit,
+    RTRIM(
+      e.Surname + ' ' +
+      UPPER(SUBSTRING(e.Name, 1, 1)) + '. ' +
+      UPPER(SUBSTRING(e.Patronymic, 1, 1)) + '.'
+    ) as FULL_NAME,
+    ad.StatusId,
+    ws.StatusName,
+    CAST(
+      case
+        when ad.Print_Date is not null
+          or ad.SendToClientDate is not null
+          or ad.SendToDoctorDate is not null
+          or ad.SendToOrgDate is not null
+          or ad.SendToFax is not null
+        then 1
+        else 0
+      end AS bit
+    ) as Is_Print
+  FROM AllData as ad
+  LEFT JOIN WorkItemCounts as wic
+    on wic.Id_Work = ad.Id_Work
+  LEFT JOIN dbo.Employee as e
+    on e.Id_Employee = ad.Id_Employee
+  LEFT JOIN dbo.WorkStatus as ws
+    on ws.StatusID = ad.StatusId
+  order by ad.Id_Work desc -- works.MaterialNumber desc
+  return
 end
 
 GO
@@ -423,24 +462,6 @@ CREATE NONCLUSTERED INDEX [XIF3Works] ON [dbo].[Works]
 (
 	[Id_Employee_Del] ASC
 )WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
-GO
-/****** Object:  Index [IX_Works_IsDel_IdWork]    Script Date: 28.04.2024 19:21:25 ******/
-CREATE NONCLUSTERED INDEX [IX_Works_IsDel_IdWork] ON [dbo].[Works]
-(
-	[Is_Del] ASC,
-	[Id_Work] DESC
-)
-INCLUDE ([CREATE_Date], [MaterialNumber], [IS_Complit], [FIO], [StatusId], [Id_Employee], [Print_Date], [SendToClientDate], [SendToDoctorDate], [SendToOrgDate], [SendToFax])
-WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
-GO
-/****** Object:  Index [IX_WorkItem_IdWork_IsComplit]    Script Date: 28.04.2024 19:21:25 ******/
-CREATE NONCLUSTERED INDEX [IX_WorkItem_IdWork_IsComplit] ON [dbo].[WorkItem]
-(
-	[Id_Work] ASC,
-	[Is_Complit] ASC
-)
-INCLUDE ([ID_ANALIZ])
-WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
 GO
 ALTER TABLE [dbo].[Employee] ADD  DEFAULT (suser_sname()) FOR [Login_Name]
 GO
